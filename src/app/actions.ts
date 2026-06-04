@@ -6,6 +6,7 @@ import { clearSession, requireSession, roleFromPin, setSession } from "@/lib/aut
 import { prisma } from "@/lib/prisma";
 import { nextReceiptNo } from "@/lib/receipt";
 import { bangkokDate, formatQueueNo } from "@/lib/queue";
+import { isPromoEligible, promoDiscount, type PromoLite } from "@/lib/promo";
 import {
   resolveItemNeeds,
   computeIngredientCost,
@@ -53,6 +54,9 @@ type SalePayload = {
   received?: number;
   items: SaleItemInput[];
   force?: boolean;
+  customerId?: string | null;
+  promotionId?: string | null;
+  redeemPoints?: number;
 };
 
 export type StockWarning = {
@@ -68,14 +72,64 @@ export type CreateSaleResult =
   | { ok: false; requiresConfirmation: true; warnings: StockWarning[] };
 
 export async function createSale(payload: SalePayload): Promise<CreateSaleResult> {
-  await requireSession(["OWNER", "STAFF"]);
+  const session = await requireSession(["OWNER", "STAFF"]);
   if (!payload.items.length) throw new Error("ไม่มีรายการในตะกร้า");
 
   const subtotal = payload.items.reduce((sum, item) => sum + item.total, 0);
 
+  // ── Load settings + customer + promotion (server-side validation) ─────────
+  const [settings, customer, promotion] = await Promise.all([
+    prisma.shopSetting.findUnique({ where: { id: "default" } }),
+    payload.customerId ? prisma.customer.findUnique({ where: { id: payload.customerId } }) : null,
+    payload.promotionId ? prisma.promotion.findUnique({ where: { id: payload.promotionId } }) : null,
+  ]);
+
+  const bahtPerPoint = settings?.bahtPerPoint ?? 25;
+  const pointValue = settings?.pointValue ?? 1;
+
+  // ── Promotion discount (re-validated server-side) ─────────────────────────
+  let promoDisc = 0;
+  let discountType: string | null = null;
+  let discountValue = 0;
+  let validPromotionId: string | null = null;
+  if (promotion) {
+    const lite: PromoLite = {
+      id: promotion.id,
+      name: promotion.name,
+      type: promotion.type,
+      value: promotion.value,
+      minSpend: promotion.minSpend,
+      startsAt: promotion.startsAt?.toISOString() ?? null,
+      endsAt: promotion.endsAt?.toISOString() ?? null,
+      isActive: promotion.isActive,
+    };
+    if (isPromoEligible(lite, subtotal)) {
+      promoDisc = promoDiscount(lite, subtotal);
+      discountType = promotion.type;
+      discountValue = promotion.value;
+      validPromotionId = promotion.id;
+    }
+  }
+
+  // ── Points redemption ─────────────────────────────────────────────────────
+  let redeemPoints = Math.max(0, Math.floor(payload.redeemPoints ?? 0));
+  if (!customer) redeemPoints = 0;
+  if (customer) redeemPoints = Math.min(redeemPoints, customer.points);
+  const remainingAfterPromo = Math.max(0, subtotal - promoDisc);
+  let pointsDisc = redeemPoints * pointValue;
+  if (pointsDisc > remainingAfterPromo) {
+    pointsDisc = remainingAfterPromo;
+    redeemPoints = pointValue > 0 ? Math.ceil(pointsDisc / pointValue) : 0;
+  }
+  if (redeemPoints > 0 && !discountType) discountType = "POINTS";
+
+  const discountAmount = promoDisc + pointsDisc;
+  const total = Math.max(0, subtotal - discountAmount);
+
+  // ── Cash validation against final total ───────────────────────────────────
   if (payload.paymentMethod === "CASH") {
     const received = payload.received ?? 0;
-    if (received < subtotal) throw new Error("จำนวนเงินที่รับน้อยกว่ายอดรวม");
+    if (received < total) throw new Error("จำนวนเงินที่รับน้อยกว่ายอดรวม");
   }
 
   // ── Resolve ingredient needs per item ─────────────────────────────────────
@@ -90,23 +144,26 @@ export async function createSale(payload: SalePayload): Promise<CreateSaleResult
     itemNeedsMap.push(needs);
   }
 
-  // ── Stock check ───────────────────────────────────────────────────────────
+  // ── Stock check (skippable with force, respecting policy) ─────────────────
+  const allowNegative = settings?.allowNegativeStock ?? true;
   if (!payload.force) {
     const warnings = getStockWarnings(itemNeedsMap);
     if (warnings.length > 0) {
+      if (!allowNegative) {
+        throw new Error("วัตถุดิบไม่เพียงพอ และร้านตั้งค่าไม่อนุญาตให้สต็อกติดลบ");
+      }
       return { ok: false, requiresConfirmation: true, warnings };
     }
   }
 
-  // ── Build payment values ──────────────────────────────────────────────────
   const received = payload.paymentMethod === "CASH" ? (payload.received ?? 0) : undefined;
-  const change = payload.paymentMethod === "CASH" ? (received ?? 0) - subtotal : undefined;
+  const change = payload.paymentMethod === "CASH" ? (received ?? 0) - total : undefined;
   const receiptNo = await nextReceiptNo();
   const queueDate = bangkokDate();
+  const pointsEarned = customer ? Math.floor(total / bahtPerPoint) : 0;
 
-  // ── Create sale + deduct stock atomically ─────────────────────────────────
+  // ── Atomic: sale + stock deduction + loyalty ──────────────────────────────
   const sale = await prisma.$transaction(async (tx) => {
-    // Generate queue number inside the transaction (atomic, no reuse of cancelled)
     const latestQueue = await tx.sale.findFirst({
       where: { queueDate },
       orderBy: { queueNo: "desc" },
@@ -120,9 +177,17 @@ export async function createSale(payload: SalePayload): Promise<CreateSaleResult
         receiptNo,
         paymentMethod: payload.paymentMethod,
         subtotal,
-        total: subtotal,
+        discountType,
+        discountValue,
+        discountAmount,
+        promotionId: validPromotionId,
+        total,
         received,
         change,
+        cashierRole: session.role,
+        customerId: customer?.id ?? null,
+        pointsEarned,
+        pointsRedeemed: redeemPoints,
         queueNo,
         queueDate,
         queueStatus: "NEW",
@@ -162,6 +227,50 @@ export async function createSale(payload: SalePayload): Promise<CreateSaleResult
       }
     }
 
+    // ── Loyalty updates ─────────────────────────────────────────────────────
+    if (customer) {
+      let pts = customer.points;
+      if (redeemPoints > 0) {
+        const before = pts;
+        pts -= redeemPoints;
+        await tx.customerPointMovement.create({
+          data: {
+            customerId: customer.id,
+            saleId: sale.id,
+            type: "REDEEM",
+            points: -redeemPoints,
+            beforePoints: before,
+            afterPoints: pts,
+            note: `แลกแต้มเป็นส่วนลด ${pointsDisc} บาท`,
+          },
+        });
+      }
+      if (pointsEarned > 0) {
+        const before = pts;
+        pts += pointsEarned;
+        await tx.customerPointMovement.create({
+          data: {
+            customerId: customer.id,
+            saleId: sale.id,
+            type: "EARN",
+            points: pointsEarned,
+            beforePoints: before,
+            afterPoints: pts,
+            note: `ได้รับแต้มจากยอดซื้อ ${total} บาท`,
+          },
+        });
+      }
+      await tx.customer.update({
+        where: { id: customer.id },
+        data: {
+          points: pts,
+          totalSpend: { increment: total },
+          totalOrders: { increment: 1 },
+          lastVisitAt: new Date(),
+        },
+      });
+    }
+
     return sale;
   });
 
@@ -169,6 +278,7 @@ export async function createSale(payload: SalePayload): Promise<CreateSaleResult
   revalidatePath("/dashboard");
   revalidatePath("/ingredients");
   revalidatePath("/queue");
+  if (customer) revalidatePath(`/customers/${customer.id}`);
   return { ok: true, saleId: sale.id, queueNo: sale.queueNo! };
 }
 
@@ -176,23 +286,21 @@ export async function createSale(payload: SalePayload): Promise<CreateSaleResult
 
 export async function updateShopSettings(formData: FormData) {
   await requireSession(["OWNER"]);
+  const base = {
+    shopName: String(formData.get("shopName") ?? ""),
+    address: String(formData.get("address") ?? ""),
+    phone: String(formData.get("phone") ?? ""),
+    promptPayId: String(formData.get("promptPayId") ?? ""),
+    receiptFooter: String(formData.get("receiptFooter") ?? ""),
+    bahtPerPoint: Math.max(1, parseInt(String(formData.get("bahtPerPoint") ?? "25"), 10) || 25),
+    pointValue: Math.max(1, parseInt(String(formData.get("pointValue") ?? "1"), 10) || 1),
+    allowNegativeStock: formData.get("allowNegativeStock") === "on" || formData.get("allowNegativeStock") === "true",
+  };
   await prisma.shopSetting.upsert({
     where: { id: "default" },
-    update: {
-      shopName: String(formData.get("shopName") ?? ""),
-      address: String(formData.get("address") ?? ""),
-      phone: String(formData.get("phone") ?? ""),
-      promptPayId: String(formData.get("promptPayId") ?? ""),
-      receiptFooter: String(formData.get("receiptFooter") ?? ""),
-    },
-    create: {
-      id: "default",
-      shopName: String(formData.get("shopName") ?? "Coffee POS"),
-      address: String(formData.get("address") ?? ""),
-      phone: String(formData.get("phone") ?? ""),
-      promptPayId: String(formData.get("promptPayId") ?? ""),
-      receiptFooter: String(formData.get("receiptFooter") ?? "ขอบคุณที่อุดหนุน"),
-    },
+    update: base,
+    create: { id: "default", ...base },
   });
   revalidatePath("/settings");
+  revalidatePath("/pos");
 }

@@ -41,6 +41,19 @@ enum QueueStatus {
   CANCELLED
 }
 
+enum PromotionType {
+  FIXED_AMOUNT
+  PERCENT
+  BUY_X_GET_Y
+  HAPPY_HOUR
+}
+
+enum PointMovementType {
+  EARN
+  REDEEM
+  ADJUST
+}
+
 // ─── Shop ────────────────────────────────────────────────────────────────────
 
 model ShopSetting {
@@ -50,6 +63,11 @@ model ShopSetting {
   phone         String   @default("")
   promptPayId   String   @default("")
   receiptFooter String   @default("ขอบคุณที่อุดหนุน")
+  // Loyalty config
+  bahtPerPoint  Int      @default(25) // spend N baht to earn 1 point
+  pointValue    Int      @default(1)  // 1 point = N baht when redeemed
+  // Stock policy
+  allowNegativeStock Boolean @default(true)
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 }
@@ -204,6 +222,7 @@ model StockMovement {
   totalCost    Decimal           @db.Decimal(10, 4)
   saleId       String?
   saleItemId   String?
+  staffName    String            @default("")
   note         String            @default("")
   ingredient   Ingredient        @relation(fields: [ingredientId], references: [id])
   createdAt    DateTime          @default(now())
@@ -222,10 +241,20 @@ model Sale {
   status         SaleStatus  @default(COMPLETED)
   paymentMethod  PaymentMethod
   subtotal       Int
+  // Discounts
+  discountType   String?     // "FIXED_AMOUNT" | "PERCENT" | "POINTS"
+  discountValue  Int         @default(0)
+  discountAmount Int         @default(0)
+  promotionId    String?
   total          Int
   received       Int?
   change         Int?
   note           String      @default("")
+  cashierRole    String      @default("")
+  // Customer / loyalty
+  customerId     String?
+  pointsEarned   Int         @default(0)
+  pointsRedeemed Int         @default(0)
   // Queue
   queueNo        String?
   queueDate      String?     // YYYYMMDD Bangkok time
@@ -235,6 +264,9 @@ model Sale {
   queueServedAt  DateTime?
   cancelReason   String?
   items          SaleItem[]
+  customer       Customer?   @relation(fields: [customerId], references: [id])
+  promotion      Promotion?  @relation(fields: [promotionId], references: [id])
+  pointMovements CustomerPointMovement[]
   createdAt      DateTime    @default(now())
   updatedAt      DateTime    @updatedAt
 
@@ -243,6 +275,7 @@ model Sale {
   @@index([status])
   @@index([paymentMethod])
   @@index([queueDate, queueStatus])
+  @@index([customerId])
 }
 
 model SaleItem {
@@ -275,4 +308,60 @@ model SaleItemOption {
   modifierOption   ModifierOption @relation(fields: [modifierOptionId], references: [id])
 
   @@index([saleItemId])
+}
+
+// ─── Customers / Loyalty ───────────────────────────────────────────────────────
+
+model Customer {
+  id           String                  @id @default(cuid())
+  name         String
+  phone        String                  @unique
+  note         String                  @default("")
+  points       Int                     @default(0)
+  totalSpend   Int                     @default(0)
+  totalOrders  Int                     @default(0)
+  lastVisitAt  DateTime?
+  sales        Sale[]
+  pointMovements CustomerPointMovement[]
+  createdAt    DateTime                @default(now())
+  updatedAt    DateTime                @updatedAt
+
+  @@index([phone])
+  @@index([name])
+}
+
+model CustomerPointMovement {
+  id           String            @id @default(cuid())
+  customerId   String
+  saleId       String?
+  type         PointMovementType
+  points       Int               // signed: + earn, - redeem
+  beforePoints Int
+  afterPoints  Int
+  note         String            @default("")
+  customer     Customer          @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  sale         Sale?             @relation(fields: [saleId], references: [id], onDelete: SetNull)
+  createdAt    DateTime          @default(now())
+
+  @@index([customerId])
+  @@index([saleId])
+}
+
+// ─── Promotions ────────────────────────────────────────────────────────────────
+
+model Promotion {
+  id        String        @id @default(cuid())
+  name      String
+  type      PromotionType
+  value     Int           @default(0) // baht for FIXED, percent for PERCENT
+  minSpend  Int           @default(0)
+  startsAt  DateTime?
+  endsAt    DateTime?
+  isActive  Boolean       @default(true)
+  note      String        @default("")
+  sales     Sale[]
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  @@index([isActive])
 }

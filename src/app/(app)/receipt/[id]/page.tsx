@@ -17,7 +17,7 @@ export default async function ReceiptPage({ params }: { params: Promise<{ id: st
   const [sale, settings] = await Promise.all([
     prisma.sale.findUnique({
       where: { id },
-      include: { items: { include: { options: true } } },
+      include: { items: { include: { options: true } }, customer: true, promotion: true },
     }),
     prisma.shopSetting.findUnique({ where: { id: "default" } }),
   ]);
@@ -83,7 +83,18 @@ export default async function ReceiptPage({ params }: { params: Promise<{ id: st
 
         {/* Totals */}
         <div className="mt-6 space-y-2 border-t border-dashed border-[#c9b9a6] pt-4 text-xl">
-          <Row label="ยอดรวม" value={baht(sale.total)} />
+          {sale.discountAmount > 0 ? (
+            <>
+              <Row label="ยอดก่อนลด" value={baht(sale.subtotal)} />
+              <Row
+                label={sale.promotion ? `ส่วนลด (${sale.promotion.name})` : "ส่วนลด"}
+                value={`-${baht(sale.discountAmount)}`}
+              />
+              <Row label="ยอดสุทธิ" value={baht(sale.total)} bold />
+            </>
+          ) : (
+            <Row label="ยอดรวม" value={baht(sale.total)} bold />
+          )}
           {sale.paymentMethod === "CASH" && (
             <>
               <Row label="รับเงิน" value={baht(sale.received ?? 0)} />
@@ -91,6 +102,15 @@ export default async function ReceiptPage({ params }: { params: Promise<{ id: st
             </>
           )}
         </div>
+
+        {/* Customer / loyalty */}
+        {sale.customer && (
+          <div className="mt-4 space-y-1 rounded-xl bg-[#f7f2ea] p-4 text-base">
+            <Row label="สมาชิก" value={sale.customer.name} />
+            {sale.pointsRedeemed > 0 && <Row label="ใช้แต้ม" value={`${sale.pointsRedeemed} แต้ม`} />}
+            {sale.pointsEarned > 0 && <Row label="ได้รับแต้ม" value={`+${sale.pointsEarned} แต้ม`} />}
+          </div>
+        )}
 
         <p className="mt-8 text-center text-lg text-[#74665a]">{settings?.receiptFooter ?? "ขอบคุณที่อุดหนุน"}</p>
       </section>

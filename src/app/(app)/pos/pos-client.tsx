@@ -4,9 +4,11 @@ import Image from "next/image";
 import { useEffect, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import QRCode from "qrcode";
-import { AlertTriangle, Minus, Plus, Trash2, X } from "lucide-react";
+import { AlertTriangle, Minus, Plus, Trash2, User, X, Tag } from "lucide-react";
 import { createSale } from "@/app/actions";
 import type { StockWarning } from "@/app/actions";
+import { searchCustomers, quickAddCustomer, type CustomerLite } from "@/app/(app)/customers/actions";
+import { isPromoEligible, promoDiscount, type PromoLite } from "@/lib/promo";
 import { baht } from "@/lib/format";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -23,7 +25,19 @@ const QUICK_AMOUNTS = [20, 50, 100, 500, 1000];
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
-export function PosClient({ categories, promptPayId }: { categories: Category[]; promptPayId: string }) {
+export function PosClient({
+  categories,
+  promptPayId,
+  promotions,
+  bahtPerPoint,
+  pointValue,
+}: {
+  categories: Category[];
+  promptPayId: string;
+  promotions: PromoLite[];
+  bahtPerPoint: number;
+  pointValue: number;
+}) {
   const router = useRouter();
   const [activeCategory, setActiveCategory] = useState(categories[0]?.id ?? "");
   const [selectedItem, setSelectedItem] = useState<MenuItem | null>(null);
@@ -37,12 +51,27 @@ export function PosClient({ categories, promptPayId }: { categories: Category[];
   const [stockWarnings, setStockWarnings] = useState<StockWarning[]>([]);
   const [pendingPayload, setPendingPayload] = useState<Parameters<typeof createSale>[0] | null>(null);
 
+  // Customer / discount
+  const [customer, setCustomer] = useState<CustomerLite | null>(null);
+  const [promotionId, setPromotionId] = useState<string | null>(null);
+  const [redeemPoints, setRedeemPoints] = useState(0);
+  const [showCustomerModal, setShowCustomerModal] = useState(false);
+
   const items = categories.find((c) => c.id === activeCategory)?.items ?? [];
   const subtotal = cart.reduce((sum, i) => sum + i.total, 0);
+
+  // ── Discount calculation (mirrors server) ────────────────────────────────
+  const selectedPromo = promotions.find((p) => p.id === promotionId) ?? null;
+  const promoDisc = selectedPromo && isPromoEligible(selectedPromo, subtotal) ? promoDiscount(selectedPromo, subtotal) : 0;
+  const remainingAfterPromo = Math.max(0, subtotal - promoDisc);
+  let pointsDisc = Math.max(0, redeemPoints) * pointValue;
+  if (pointsDisc > remainingAfterPromo) pointsDisc = remainingAfterPromo;
+  const discountAmount = promoDisc + pointsDisc;
+  const total = Math.max(0, subtotal - discountAmount);
+
   const receivedAmount = Number(received || 0);
-  const change = paymentMethod === "CASH" && receivedAmount >= subtotal ? receivedAmount - subtotal : 0;
-  const canPay = cart.length > 0 && !isPending &&
-    (paymentMethod !== "CASH" || (receivedAmount >= subtotal && subtotal > 0));
+  const change = paymentMethod === "CASH" && receivedAmount >= total ? receivedAmount - total : 0;
+  const canPay = cart.length > 0 && !isPending && (paymentMethod !== "CASH" || (receivedAmount >= total && total >= 0 && subtotal > 0));
 
   const groups = selectedItem?.modifierGroups.map((e) => e.modifierGroup) ?? [];
   const selectedUnitPrice = selectedItem
@@ -52,8 +81,8 @@ export function PosClient({ categories, promptPayId }: { categories: Category[];
       }, 0)
     : 0;
 
-  const qrPayload = paymentMethod === "CASH" || subtotal <= 0
-    ? "" : `${paymentMethod === "PROMPTPAY" ? "PROMPTPAY" : "TRANSFER"}:${promptPayId}:${subtotal}`;
+  const qrPayload = paymentMethod === "CASH" || total <= 0
+    ? "" : `${paymentMethod === "PROMPTPAY" ? "PROMPTPAY" : "TRANSFER"}:${promptPayId}:${total}`;
 
   useEffect(() => {
     if (!qrPayload) return;
@@ -102,6 +131,12 @@ export function PosClient({ categories, promptPayId }: { categories: Category[];
     setCart((cur) => cur.map((i) => i.key !== key ? i : { ...i, quantity: i.quantity + delta, total: i.unitPrice * (i.quantity + delta) }).filter((i) => i.quantity > 0));
   }
 
+  function resetExtras() {
+    setCustomer(null);
+    setPromotionId(null);
+    setRedeemPoints(0);
+  }
+
   function appendReceived(digit: string) {
     setReceived((prev) => {
       if (digit === "C") return "";
@@ -113,19 +148,32 @@ export function PosClient({ categories, promptPayId }: { categories: Category[];
 
   function buildPayload(force = false): Parameters<typeof createSale>[0] {
     return {
-      paymentMethod, received: paymentMethod === "CASH" ? receivedAmount : undefined, force,
+      paymentMethod,
+      received: paymentMethod === "CASH" ? receivedAmount : undefined,
+      force,
+      customerId: customer?.id ?? null,
+      promotionId: promotionId,
+      redeemPoints,
       items: cart.map((i) => ({ menuItemId: i.menuItemId, name: i.name, quantity: i.quantity, basePrice: i.basePrice, unitPrice: i.unitPrice, total: i.total, options: i.options })),
     };
   }
 
+  function finishSale(saleId: string) {
+    setCart([]); setReceived(""); resetExtras(); setPendingPayload(null);
+    router.push(`/receipt/${saleId}`);
+  }
+
   function submitSale(force = false) {
     setError("");
+    if (typeof navigator !== "undefined" && !navigator.onLine) {
+      setError("ออฟไลน์อยู่ ยังไม่สามารถบันทึกการขายขึ้นระบบได้ (ตะกร้ายังอยู่)");
+      return;
+    }
     startTransition(async () => {
       try {
         const result = await createSale(buildPayload(force));
-        if (!result.ok) { setPendingPayload({ ...buildPayload(true) }); setStockWarnings(result.warnings); return; }
-        setCart([]); setReceived("");
-        router.push(`/receipt/${result.saleId}`);
+        if (!result.ok) { setPendingPayload(buildPayload(true)); setStockWarnings(result.warnings); return; }
+        finishSale(result.saleId);
       } catch (err) { setError(err instanceof Error ? err.message : "บันทึกไม่สำเร็จ"); }
     });
   }
@@ -137,19 +185,19 @@ export function PosClient({ categories, promptPayId }: { categories: Category[];
       try {
         const result = await createSale(pendingPayload);
         if (!result.ok) { setError("ไม่สามารถบันทึกได้"); return; }
-        setCart([]); setReceived(""); setPendingPayload(null);
-        router.push(`/receipt/${result.saleId}`);
+        finishSale(result.saleId);
       } catch (err) { setError(err instanceof Error ? err.message : "บันทึกไม่สำเร็จ"); }
     });
   }
 
-  // ── Layout: h-full grid ────────────────────────────────────────────────────
+  const maxRedeemable = customer ? Math.min(customer.points, pointValue > 0 ? Math.ceil(remainingAfterPromo / pointValue) : 0) : 0;
+  const estPointsEarned = customer ? Math.floor(total / bahtPerPoint) : 0;
+
   return (
     <div className="grid h-full grid-cols-[1fr_360px] gap-3 overflow-hidden">
 
       {/* ── LEFT: Categories + Menu grid ───────────────────────────────── */}
       <section className="flex h-full flex-col gap-3 overflow-hidden">
-        {/* Category tabs — fixed height, horizontal scroll */}
         <div className="flex shrink-0 gap-2 overflow-x-auto pb-1">
           {categories.map((cat) => (
             <button key={cat.id} onClick={() => setActiveCategory(cat.id)}
@@ -158,7 +206,6 @@ export function PosClient({ categories, promptPayId }: { categories: Category[];
             </button>
           ))}
         </div>
-        {/* Menu grid — fills remaining height, scrolls vertically */}
         <div className="min-h-0 flex-1 overflow-y-auto">
           <div className="grid grid-cols-3 gap-2 xl:grid-cols-4">
             {items.map((item) => (
@@ -174,18 +221,16 @@ export function PosClient({ categories, promptPayId }: { categories: Category[];
 
       {/* ── RIGHT: Cart + Payment ───────────────────────────────────────── */}
       <aside className="flex h-full flex-col overflow-hidden rounded-xl border border-[#ded1be] bg-white shadow-sm">
-
-        {/* Cart header */}
         <div className="flex shrink-0 items-center justify-between border-b border-[#eadfce] px-4 py-3">
           <h2 className="text-xl font-bold">ตะกร้า</h2>
           {cart.length > 0 && (
-            <button onClick={() => setCart([])} className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs font-semibold text-red-600 hover:bg-red-50">
+            <button onClick={() => { setCart([]); resetExtras(); }} className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs font-semibold text-red-600 hover:bg-red-50">
               <Trash2 size={13} /> ล้าง
             </button>
           )}
         </div>
 
-        {/* Cart items — scrollable flex-1 */}
+        {/* Cart items */}
         <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-2">
           {cart.length === 0 ? (
             <p className="py-8 text-center text-base text-[#74665a]">ยังไม่มีรายการ</p>
@@ -194,9 +239,7 @@ export function PosClient({ categories, promptPayId }: { categories: Category[];
               <div className="flex min-w-0 items-start justify-between gap-2">
                 <div className="min-w-0 flex-1">
                   <p className="text-base font-bold leading-tight">{item.name}</p>
-                  {item.options.length > 0 && (
-                    <p className="mt-0.5 text-xs text-[#74665a]">{item.options.map((o) => o.optionName).join(" · ")}</p>
-                  )}
+                  {item.options.length > 0 && <p className="mt-0.5 text-xs text-[#74665a]">{item.options.map((o) => o.optionName).join(" · ")}</p>}
                 </div>
                 <button onClick={() => adjustQty(item.key, -item.quantity)} className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-white text-red-500"><Trash2 size={14} /></button>
               </div>
@@ -212,14 +255,42 @@ export function PosClient({ categories, promptPayId }: { categories: Category[];
           ))}
         </div>
 
-        {/* Payment section — fixed at bottom, no shrink */}
+        {/* Payment section */}
         <div className="shrink-0 space-y-2 border-t border-[#eadfce] p-3" style={{ paddingBottom: "max(12px, env(safe-area-inset-bottom))" }}>
 
-          {/* Total */}
-          <div className="flex items-center justify-between">
-            <span className="text-xl font-bold">รวม</span>
-            <span className="text-2xl font-bold text-[#4b3427]">{baht(subtotal)}</span>
+          {/* Customer + discount row */}
+          <div className="grid grid-cols-2 gap-1.5">
+            <button onClick={() => setShowCustomerModal(true)}
+              title={customer && estPointsEarned > 0 ? `จะได้รับ ${estPointsEarned} แต้ม` : undefined}
+              className={`flex h-9 items-center justify-center gap-1.5 rounded-xl px-2 text-sm font-bold ${customer ? "bg-[#4b3427] text-white" : "bg-[#f0e5d7] text-[#4b3427]"}`}>
+              <User size={15} />{customer ? `${customer.name}${estPointsEarned > 0 ? ` (+${estPointsEarned})` : ""}` : "ลูกค้า"}
+            </button>
+            <button onClick={() => setShowCustomerModal(true)}
+              className={`flex h-9 items-center justify-center gap-1.5 rounded-xl px-2 text-sm font-bold ${discountAmount > 0 ? "bg-emerald-600 text-white" : "bg-[#f0e5d7] text-[#4b3427]"}`}>
+              <Tag size={15} />{discountAmount > 0 ? `-${baht(discountAmount)}` : "ส่วนลด"}
+            </button>
           </div>
+
+          {/* Totals */}
+          {discountAmount > 0 ? (
+            <div className="space-y-0.5">
+              <div className="flex items-center justify-between text-sm text-[#74665a]">
+                <span>ยอดรวม</span><span>{baht(subtotal)}</span>
+              </div>
+              <div className="flex items-center justify-between text-sm text-emerald-700">
+                <span>ส่วนลด</span><span>-{baht(discountAmount)}</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-xl font-bold">สุทธิ</span>
+                <span className="text-2xl font-bold text-[#4b3427]">{baht(total)}</span>
+              </div>
+            </div>
+          ) : (
+            <div className="flex items-center justify-between">
+              <span className="text-xl font-bold">รวม</span>
+              <span className="text-2xl font-bold text-[#4b3427]">{baht(total)}</span>
+            </div>
+          )}
 
           {/* Payment method */}
           <div className="grid grid-cols-3 gap-1.5">
@@ -233,21 +304,15 @@ export function PosClient({ categories, promptPayId }: { categories: Category[];
 
           {paymentMethod === "CASH" ? (
             <div className="space-y-2">
-              {/* Received display */}
               <div className="flex h-11 items-center justify-between rounded-xl border-2 border-[#d8c8b5] bg-[#f7f2ea] px-3">
                 <span className="text-sm text-[#74665a]">รับเงิน</span>
                 <span className="text-xl font-bold">{received ? baht(Number(received)) : "—"}</span>
               </div>
-              {/* Quick amounts */}
               <div className="grid grid-cols-5 gap-1">
                 {QUICK_AMOUNTS.map((amount) => (
-                  <button key={amount} onClick={() => setReceived(String(amount))}
-                    className="h-8 rounded-lg bg-[#f0e5d7] text-xs font-bold text-[#4b3427] hover:bg-[#e5d5c0]">
-                    {amount}
-                  </button>
+                  <button key={amount} onClick={() => setReceived(String(amount))} className="h-8 rounded-lg bg-[#f0e5d7] text-xs font-bold text-[#4b3427] hover:bg-[#e5d5c0]">{amount}</button>
                 ))}
               </div>
-              {/* Numpad — compact h-10 rows */}
               <div className="grid grid-cols-3 gap-1">
                 {["1","2","3","4","5","6","7","8","9","C","0","⌫"].map((key) => (
                   <button key={key} onClick={() => appendReceived(key)}
@@ -256,26 +321,23 @@ export function PosClient({ categories, promptPayId }: { categories: Category[];
                   </button>
                 ))}
               </div>
-              {/* Change */}
               <div className="flex items-center justify-between rounded-xl bg-emerald-50 px-3 py-2">
                 <span className="text-base font-bold text-emerald-800">เงินทอน</span>
                 <span className="text-xl font-bold text-emerald-700">{baht(change)}</span>
               </div>
             </div>
           ) : (
-            /* QR */
             <div className="rounded-xl bg-[#f7f2ea] p-3 text-center">
               {qrCode.payload === qrPayload && qrCode.dataUrl
                 ? <Image src={qrCode.dataUrl} alt="QR" width={160} height={160} unoptimized className="mx-auto" />
                 : <div className="mx-auto h-[160px] w-[160px] rounded-lg bg-[#e8ddd0]" />}
-              <p className="mt-2 text-lg font-bold">ยอดชำระ {baht(subtotal)}</p>
+              <p className="mt-2 text-lg font-bold">ยอดชำระ {baht(total)}</p>
               <p className="text-xs text-[#74665a]">{paymentMethod === "PROMPTPAY" ? `พร้อมเพย์: ${promptPayId}` : "โอนตามบัญชีร้าน"}</p>
             </div>
           )}
 
           {error && <p className="rounded-xl bg-red-50 px-3 py-2 text-center text-sm font-semibold text-red-700">{error}</p>}
 
-          {/* Pay button */}
           <button disabled={!canPay} onClick={() => submitSale(false)}
             className="h-14 w-full rounded-xl text-xl font-bold text-white transition-colors disabled:cursor-not-allowed disabled:bg-[#c5b9b0] enabled:bg-[#2f6f4e] enabled:active:bg-[#245940]">
             {isPending ? "กำลังบันทึก..." : "ชำระเงิน"}
@@ -307,8 +369,7 @@ export function PosClient({ categories, promptPayId }: { categories: Category[];
                       return (
                         <button key={option.id} onClick={() => toggleOption(group, option.id)}
                           className={`min-h-12 rounded-xl border-2 px-3 py-2 text-base font-bold transition-colors ${active ? "border-[#4b3427] bg-[#4b3427] text-white" : "border-[#ded1be] bg-[#f7f2ea] hover:border-[#4b3427]"}`}>
-                          {option.name}
-                          {option.priceDelta ? <span className="block text-xs font-semibold opacity-80">+{option.priceDelta}</span> : null}
+                          {option.name}{option.priceDelta ? <span className="block text-xs font-semibold opacity-80">+{option.priceDelta}</span> : null}
                         </button>
                       );
                     })}
@@ -317,11 +378,26 @@ export function PosClient({ categories, promptPayId }: { categories: Category[];
               ))}
             </div>
             {error && <p className="mt-3 rounded-xl bg-red-50 px-4 py-2 text-center text-sm font-semibold text-red-700">{error}</p>}
-            <button onClick={addSelectedItem} className="mt-4 h-14 w-full rounded-xl bg-[#4b3427] text-xl font-bold text-white active:bg-[#3a2820]">
-              เพิ่มลงตะกร้า
-            </button>
+            <button onClick={addSelectedItem} className="mt-4 h-14 w-full rounded-xl bg-[#4b3427] text-xl font-bold text-white active:bg-[#3a2820]">เพิ่มลงตะกร้า</button>
           </section>
         </div>
+      )}
+
+      {/* ── Customer + Discount modal ──────────────────────────────────── */}
+      {showCustomerModal && (
+        <CustomerDiscountModal
+          subtotal={subtotal}
+          promotions={promotions}
+          pointValue={pointValue}
+          customer={customer}
+          promotionId={promotionId}
+          redeemPoints={redeemPoints}
+          maxRedeemable={maxRedeemable}
+          onSetCustomer={setCustomer}
+          onSetPromotion={setPromotionId}
+          onSetRedeemPoints={setRedeemPoints}
+          onClose={() => setShowCustomerModal(false)}
+        />
       )}
 
       {/* ── Stock warning dialog ────────────────────────────────────────── */}
@@ -359,6 +435,140 @@ export function PosClient({ categories, promptPayId }: { categories: Category[];
           </section>
         </div>
       )}
+    </div>
+  );
+}
+
+// ─── Customer + Discount Modal ──────────────────────────────────────────────────
+
+function CustomerDiscountModal({
+  subtotal, promotions, pointValue, customer, promotionId, redeemPoints, maxRedeemable,
+  onSetCustomer, onSetPromotion, onSetRedeemPoints, onClose,
+}: {
+  subtotal: number;
+  promotions: PromoLite[];
+  pointValue: number;
+  customer: CustomerLite | null;
+  promotionId: string | null;
+  redeemPoints: number;
+  maxRedeemable: number;
+  onSetCustomer: (c: CustomerLite | null) => void;
+  onSetPromotion: (id: string | null) => void;
+  onSetRedeemPoints: (n: number) => void;
+  onClose: () => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<CustomerLite[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [addName, setAddName] = useState("");
+  const [addPhone, setAddPhone] = useState("");
+  const [err, setErr] = useState("");
+
+  async function doSearch() {
+    setSearching(true); setErr("");
+    try { setResults(await searchCustomers(query)); }
+    catch { setErr("ค้นหาไม่สำเร็จ"); }
+    finally { setSearching(false); }
+  }
+
+  async function doAdd() {
+    setErr("");
+    try {
+      const c = await quickAddCustomer(addName, addPhone);
+      onSetCustomer(c);
+      setAddName(""); setAddPhone("");
+    } catch (e) { setErr(e instanceof Error ? e.message : "เพิ่มไม่สำเร็จ"); }
+  }
+
+  const eligiblePromos = promotions.filter((p) => isPromoEligible(p, subtotal));
+
+  return (
+    <div className="fixed inset-0 z-40 grid place-items-center bg-black/50 p-4" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <section className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-2xl bg-white p-5 shadow-xl">
+        <div className="mb-4 flex items-center justify-between">
+          <h3 className="text-2xl font-bold">ลูกค้า & ส่วนลด</h3>
+          <button onClick={onClose} className="grid h-11 w-11 place-items-center rounded-xl bg-[#f0e5d7] text-[#4b3427]"><X size={20} /></button>
+        </div>
+
+        {/* Customer */}
+        <div className="mb-5">
+          <p className="mb-2 text-lg font-bold">ลูกค้า</p>
+          {customer ? (
+            <div className="flex items-center justify-between rounded-xl bg-[#f0e5d7] p-3">
+              <div>
+                <p className="font-bold">{customer.name}</p>
+                <p className="text-sm text-[#74665a]">{customer.phone} · {customer.points} แต้ม</p>
+              </div>
+              <button onClick={() => { onSetCustomer(null); onSetRedeemPoints(0); }} className="rounded-lg bg-white px-3 py-2 text-sm font-bold text-red-600">นำออก</button>
+            </div>
+          ) : (
+            <>
+              <div className="flex gap-2">
+                <input value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => e.key === "Enter" && doSearch()}
+                  placeholder="ค้นหาเบอร์โทร / ชื่อ" className="h-11 flex-1 rounded-xl border-2 border-[#d8c8b5] px-3 text-base outline-none focus:border-[#4b3427]" />
+                <button onClick={doSearch} className="h-11 rounded-xl bg-[#4b3427] px-4 text-sm font-bold text-white">{searching ? "..." : "ค้นหา"}</button>
+              </div>
+              {results.length > 0 && (
+                <div className="mt-2 space-y-1">
+                  {results.map((c) => (
+                    <button key={c.id} onClick={() => { onSetCustomer(c); setResults([]); }}
+                      className="flex w-full items-center justify-between rounded-xl bg-[#f7f2ea] p-3 text-left hover:bg-[#f0e5d7]">
+                      <span className="font-bold">{c.name}</span>
+                      <span className="text-sm text-[#74665a]">{c.phone} · {c.points} แต้ม</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+              <div className="mt-3 rounded-xl border border-dashed border-[#ded1be] p-3">
+                <p className="mb-2 text-sm font-bold text-[#74665a]">เพิ่มลูกค้าใหม่</p>
+                <div className="flex gap-2">
+                  <input value={addName} onChange={(e) => setAddName(e.target.value)} placeholder="ชื่อ" className="h-10 flex-1 rounded-xl border-2 border-[#d8c8b5] px-3 text-sm outline-none focus:border-[#4b3427]" />
+                  <input value={addPhone} onChange={(e) => setAddPhone(e.target.value)} inputMode="tel" placeholder="เบอร์โทร" className="h-10 flex-1 rounded-xl border-2 border-[#d8c8b5] px-3 text-sm outline-none focus:border-[#4b3427]" />
+                  <button onClick={doAdd} className="h-10 rounded-xl bg-emerald-600 px-3 text-sm font-bold text-white">เพิ่ม</button>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* Points redemption */}
+        {customer && customer.points > 0 && (
+          <div className="mb-5">
+            <p className="mb-2 text-lg font-bold">แลกแต้ม <span className="text-sm font-normal text-[#74665a]">(1 แต้ม = {pointValue} บาท)</span></p>
+            <div className="flex items-center gap-2">
+              <input type="number" min={0} max={maxRedeemable} value={redeemPoints || ""} onChange={(e) => onSetRedeemPoints(Math.max(0, Math.min(maxRedeemable, parseInt(e.target.value || "0", 10))))}
+                placeholder="0" className="h-11 flex-1 rounded-xl border-2 border-[#d8c8b5] px-3 text-base outline-none focus:border-[#4b3427]" />
+              <button onClick={() => onSetRedeemPoints(maxRedeemable)} className="h-11 rounded-xl bg-[#f0e5d7] px-4 text-sm font-bold text-[#4b3427]">สูงสุด ({maxRedeemable})</button>
+            </div>
+          </div>
+        )}
+
+        {/* Promotions */}
+        <div className="mb-5">
+          <p className="mb-2 text-lg font-bold">โปรโมชั่น</p>
+          {eligiblePromos.length === 0 ? (
+            <p className="rounded-xl bg-[#f7f2ea] p-3 text-sm text-[#74665a]">ไม่มีโปรโมชั่นที่ใช้ได้กับยอดนี้</p>
+          ) : (
+            <div className="space-y-1">
+              <button onClick={() => onSetPromotion(null)}
+                className={`flex w-full items-center justify-between rounded-xl p-3 text-left ${!promotionId ? "bg-[#4b3427] text-white" : "bg-[#f7f2ea]"}`}>
+                <span className="font-bold">ไม่ใช้โปรโมชั่น</span>
+              </button>
+              {eligiblePromos.map((p) => (
+                <button key={p.id} onClick={() => onSetPromotion(p.id)}
+                  className={`flex w-full items-center justify-between rounded-xl p-3 text-left ${promotionId === p.id ? "bg-emerald-600 text-white" : "bg-[#f7f2ea] hover:bg-[#f0e5d7]"}`}>
+                  <span className="font-bold">{p.name}</span>
+                  <span className="text-sm">{p.type === "PERCENT" ? `${p.value}%` : `${p.value} บาท`}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {err && <p className="mb-3 rounded-xl bg-red-50 px-3 py-2 text-center text-sm font-semibold text-red-700">{err}</p>}
+
+        <button onClick={onClose} className="h-14 w-full rounded-xl bg-[#4b3427] text-xl font-bold text-white">เสร็จสิ้น</button>
+      </section>
     </div>
   );
 }

@@ -48,6 +48,13 @@ export default async function DashboardPage() {
     PROMPTPAY: sales.filter((s) => s.paymentMethod === "PROMPTPAY").reduce((sum, s) => sum + s.total, 0),
   };
 
+  // Best sellers today
+  const menuMap = new Map<string, number>();
+  for (const s of sales) {
+    for (const i of s.items) menuMap.set(i.name, (menuMap.get(i.name) ?? 0) + i.quantity);
+  }
+  const bestSellers = [...menuMap.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5);
+
   const hasStockAlerts = lowStockIngredients.length > 0 || negativeStockIngredients.length > 0;
 
   return (
@@ -130,6 +137,24 @@ export default async function DashboardPage() {
                 <Link href="/ingredients" className="mt-3 block text-sm font-bold text-amber-700 hover:underline">จัดการวัตถุดิบ →</Link>
               </div>
             )}
+          </div>
+        </section>
+      )}
+
+      {/* Best sellers today */}
+      {bestSellers.length > 0 && (
+        <section className="mt-5 rounded-2xl border border-[#ded1be] bg-white">
+          <h2 className="border-b border-[#eadfce] px-5 py-4 text-2xl font-bold">เมนูขายดีวันนี้</h2>
+          <div className="divide-y divide-[#eadfce]">
+            {bestSellers.map(([name, qty], idx) => (
+              <div key={name} className="flex items-center justify-between px-5 py-3 text-lg">
+                <span className="flex items-center gap-3">
+                  <span className="grid h-7 w-7 place-items-center rounded-full bg-[#f0e5d7] text-sm font-bold text-[#4b3427]">{idx + 1}</span>
+                  <span className="font-bold">{name}</span>
+                </span>
+                <span className="font-bold text-[#74665a]">{qty} แก้ว</span>
+              </div>
+            ))}
           </div>
         </section>
       )}
