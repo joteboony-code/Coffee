@@ -33,6 +33,14 @@ enum StockMovementType {
   REFUND
 }
 
+enum QueueStatus {
+  NEW
+  MAKING
+  READY
+  SERVED
+  CANCELLED
+}
+
 // ─── Shop ────────────────────────────────────────────────────────────────────
 
 model ShopSetting {
@@ -209,22 +217,32 @@ model StockMovement {
 // ─── Sales ───────────────────────────────────────────────────────────────────
 
 model Sale {
-  id            String        @id @default(cuid())
-  receiptNo     String        @unique
-  status        SaleStatus    @default(COMPLETED)
-  paymentMethod PaymentMethod
-  subtotal      Int
-  total         Int
-  received      Int?
-  change        Int?
-  note          String        @default("")
-  items         SaleItem[]
-  createdAt     DateTime      @default(now())
-  updatedAt     DateTime      @updatedAt
+  id             String      @id @default(cuid())
+  receiptNo      String      @unique
+  status         SaleStatus  @default(COMPLETED)
+  paymentMethod  PaymentMethod
+  subtotal       Int
+  total          Int
+  received       Int?
+  change         Int?
+  note           String      @default("")
+  // Queue
+  queueNo        String?
+  queueDate      String?     // YYYYMMDD Bangkok time
+  queueStatus    QueueStatus @default(NEW)
+  queueStartedAt DateTime?
+  queueReadyAt   DateTime?
+  queueServedAt  DateTime?
+  cancelReason   String?
+  items          SaleItem[]
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
 
+  @@unique([queueDate, queueNo])
   @@index([createdAt])
   @@index([status])
   @@index([paymentMethod])
+  @@index([queueDate, queueStatus])
 }
 
 model SaleItem {

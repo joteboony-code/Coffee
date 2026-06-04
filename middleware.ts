@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 
 const AUTH_COOKIE = "coff_session";
-const STAFF_PAGES = new Set(["/pos", "/sales"]);
+// Pages STAFF are allowed to access (exact match or prefix)
+const STAFF_EXACT = new Set(["/pos", "/sales", "/queue"]);
+const STAFF_PREFIX = ["/receipt/", "/sales", "/queue"];
 const PUBLIC_PATHS = new Set(["/"]);
 
 function base64UrlToBytes(value: string) {
@@ -22,7 +24,7 @@ async function sign(payload: string) {
     new TextEncoder().encode(process.env.AUTH_SECRET || "dev-only-change-me"),
     { name: "HMAC", hash: "SHA-256" },
     false,
-    ["sign"]
+    ["sign"],
   );
   const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
   return bytesToBase64Url(new Uint8Array(sig));
@@ -60,9 +62,8 @@ export async function middleware(request: NextRequest) {
 
   if (role === "STAFF") {
     const allowed =
-      STAFF_PAGES.has(pathname) ||
-      pathname.startsWith("/receipt/") ||
-      pathname.startsWith("/sales");
+      STAFF_EXACT.has(pathname) ||
+      STAFF_PREFIX.some((prefix) => pathname.startsWith(prefix));
     if (!allowed) return NextResponse.redirect(new URL("/pos", request.url));
   }
 
@@ -70,5 +71,5 @@ export async function middleware(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"]
+  matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
 };

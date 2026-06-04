@@ -5,7 +5,14 @@ import { revalidatePath } from "next/cache";
 import { clearSession, requireSession, roleFromPin, setSession } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { nextReceiptNo } from "@/lib/receipt";
-import { resolveItemNeeds, computeIngredientCost, getStockWarnings, deductIngredients, type IngredientNeed } from "@/lib/stock";
+import { bangkokDate, formatQueueNo } from "@/lib/queue";
+import {
+  resolveItemNeeds,
+  computeIngredientCost,
+  getStockWarnings,
+  deductIngredients,
+  type IngredientNeed,
+} from "@/lib/stock";
 import type { PaymentMethod } from "@prisma/client";
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
@@ -45,7 +52,7 @@ type SalePayload = {
   paymentMethod: PaymentMethod;
   received?: number;
   items: SaleItemInput[];
-  force?: boolean; // skip stock warning, allow negative stock
+  force?: boolean;
 };
 
 export type StockWarning = {
@@ -57,7 +64,7 @@ export type StockWarning = {
 };
 
 export type CreateSaleResult =
-  | { ok: true; saleId: string }
+  | { ok: true; saleId: string; queueNo: string }
   | { ok: false; requiresConfirmation: true; warnings: StockWarning[] };
 
 export async function createSale(payload: SalePayload): Promise<CreateSaleResult> {
@@ -74,8 +81,12 @@ export async function createSale(payload: SalePayload): Promise<CreateSaleResult
   // ── Resolve ingredient needs per item ─────────────────────────────────────
   const itemNeedsMap: Map<string, IngredientNeed>[] = [];
   for (const item of payload.items) {
-    const selectedOptionIds = item.options.map((o) => o.modifierOptionId);
-    const needs = await resolveItemNeeds(prisma, item.menuItemId, item.quantity, selectedOptionIds);
+    const needs = await resolveItemNeeds(
+      prisma,
+      item.menuItemId,
+      item.quantity,
+      item.options.map((o) => o.modifierOptionId),
+    );
     itemNeedsMap.push(needs);
   }
 
@@ -87,13 +98,23 @@ export async function createSale(payload: SalePayload): Promise<CreateSaleResult
     }
   }
 
-  // ── Create sale in transaction ────────────────────────────────────────────
+  // ── Build payment values ──────────────────────────────────────────────────
   const received = payload.paymentMethod === "CASH" ? (payload.received ?? 0) : undefined;
   const change = payload.paymentMethod === "CASH" ? (received ?? 0) - subtotal : undefined;
   const receiptNo = await nextReceiptNo();
+  const queueDate = bangkokDate();
 
+  // ── Create sale + deduct stock atomically ─────────────────────────────────
   const sale = await prisma.$transaction(async (tx) => {
-    // Create sale record first
+    // Generate queue number inside the transaction (atomic, no reuse of cancelled)
+    const latestQueue = await tx.sale.findFirst({
+      where: { queueDate },
+      orderBy: { queueNo: "desc" },
+      select: { queueNo: true },
+    });
+    const queueSeq = latestQueue?.queueNo ? Number(latestQueue.queueNo.slice(1)) : 0;
+    const queueNo = formatQueueNo(queueSeq + 1);
+
     const sale = await tx.sale.create({
       data: {
         receiptNo,
@@ -102,17 +123,16 @@ export async function createSale(payload: SalePayload): Promise<CreateSaleResult
         total: subtotal,
         received,
         change,
+        queueNo,
+        queueDate,
+        queueStatus: "NEW",
       },
     });
 
-    // Create each sale item and deduct ingredients
     for (let i = 0; i < payload.items.length; i++) {
       const item = payload.items[i];
       const needs = itemNeedsMap[i];
-
-      // Compute costs from this item's ingredient needs
       const ingredientCost = computeIngredientCost(needs);
-      const grossProfit = item.total - ingredientCost;
 
       const saleItem = await tx.saleItem.create({
         data: {
@@ -124,7 +144,7 @@ export async function createSale(payload: SalePayload): Promise<CreateSaleResult
           unitPrice: item.unitPrice,
           total: item.total,
           ingredientCost,
-          grossProfit,
+          grossProfit: item.total - ingredientCost,
           options: {
             create: item.options.map((opt) => ({
               modifierGroupId: opt.modifierGroupId,
@@ -137,7 +157,6 @@ export async function createSale(payload: SalePayload): Promise<CreateSaleResult
         },
       });
 
-      // Deduct ingredients
       if (needs.size > 0) {
         await deductIngredients(tx, sale.id, saleItem.id, needs);
       }
@@ -149,7 +168,8 @@ export async function createSale(payload: SalePayload): Promise<CreateSaleResult
   revalidatePath("/sales");
   revalidatePath("/dashboard");
   revalidatePath("/ingredients");
-  return { ok: true, saleId: sale.id };
+  revalidatePath("/queue");
+  return { ok: true, saleId: sale.id, queueNo: sale.queueNo! };
 }
 
 // ─── Shop Settings ────────────────────────────────────────────────────────────

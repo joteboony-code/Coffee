@@ -3,13 +3,14 @@ import { AlertTriangle } from "lucide-react";
 import { prisma } from "@/lib/prisma";
 import { requireSession } from "@/lib/auth";
 import { baht, startOfBangkokDay, thaiDate } from "@/lib/format";
+import { bangkokDate } from "@/lib/queue";
 
 export default async function DashboardPage() {
   await requireSession(["OWNER"]);
 
   const start = startOfBangkokDay();
 
-  const [sales, lowStockIngredients, negativeStockIngredients] = await Promise.all([
+  const [sales, lowStockIngredients, negativeStockIngredients, queueToday, queuePending] = await Promise.all([
     prisma.sale.findMany({
       where: { createdAt: { gte: start }, status: "COMPLETED" },
       include: { items: true },
@@ -26,6 +27,8 @@ export default async function DashboardPage() {
       where: { isActive: true, currentStock: { lt: 0 } },
       orderBy: { currentStock: "asc" },
     }),
+    prisma.sale.count({ where: { queueDate: bangkokDate() } }),
+    prisma.sale.count({ where: { queueDate: bangkokDate(), queueStatus: { in: ["NEW", "MAKING", "READY"] } } }),
   ]);
 
   const revenue = sales.reduce((sum, s) => sum + s.total, 0);
@@ -61,6 +64,15 @@ export default async function DashboardPage() {
         <Metric label="จำนวนบิล" value={String(sales.length)} large />
         <Metric label="จำนวนรายการ" value={String(cups)} large />
       </div>
+
+      {/* Queue stats */}
+      <section className="mt-5 rounded-2xl border border-[#ded1be] bg-white p-5">
+        <h2 className="mb-4 text-2xl font-bold">สถานะคิว</h2>
+        <div className="grid grid-cols-2 gap-4">
+          <Metric label="คิวทั้งหมดวันนี้" value={String(queueToday)} color={queueToday > 0 ? "default" : "default"} />
+          <Metric label="คิวรอดำเนินการ" value={String(queuePending)} color={queuePending > 0 ? "amber" : "default"} />
+        </div>
+      </section>
 
       {/* Cost breakdown */}
       <section className="mt-5 rounded-2xl border border-[#ded1be] bg-white p-5">
