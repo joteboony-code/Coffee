@@ -1,0 +1,260 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum PaymentMethod {
+  CASH
+  TRANSFER
+  PROMPTPAY
+}
+
+enum SaleStatus {
+  COMPLETED
+  CANCELLED
+  REFUNDED
+}
+
+enum ModifierSelectionType {
+  SINGLE
+  MULTIPLE
+}
+
+enum StockMovementType {
+  RECEIVE
+  SALE
+  ADJUST
+  WASTE
+  REFUND
+}
+
+// ─── Shop ────────────────────────────────────────────────────────────────────
+
+model ShopSetting {
+  id            String   @id @default(cuid())
+  shopName      String   @default("Coffee POS")
+  address       String   @default("")
+  phone         String   @default("")
+  promptPayId   String   @default("")
+  receiptFooter String   @default("ขอบคุณที่อุดหนุน")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+// ─── Menu ────────────────────────────────────────────────────────────────────
+
+model Category {
+  id        String     @id @default(cuid())
+  name      String     @unique
+  sortOrder Int        @default(0)
+  isActive  Boolean    @default(true)
+  items     MenuItem[]
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+}
+
+model MenuItem {
+  id             String                  @id @default(cuid())
+  name           String
+  price          Int
+  isActive       Boolean                 @default(true)
+  categoryId     String
+  category       Category                @relation(fields: [categoryId], references: [id])
+  modifierGroups MenuItemModifierGroup[]
+  saleItems      SaleItem[]
+  recipes        Recipe[]
+  createdAt      DateTime                @default(now())
+  updatedAt      DateTime                @updatedAt
+
+  @@unique([name, categoryId])
+  @@index([categoryId])
+}
+
+model ModifierGroup {
+  id         String                  @id @default(cuid())
+  name       String                  @unique
+  type       ModifierSelectionType
+  isRequired Boolean                 @default(false)
+  sortOrder  Int                     @default(0)
+  options    ModifierOption[]
+  menuItems  MenuItemModifierGroup[]
+  createdAt  DateTime                @default(now())
+  updatedAt  DateTime                @updatedAt
+}
+
+model ModifierOption {
+  id                String             @id @default(cuid())
+  name              String
+  priceDelta        Int                @default(0)
+  sortOrder         Int                @default(0)
+  modifierGroupId   String
+  modifierGroup     ModifierGroup      @relation(fields: [modifierGroupId], references: [id], onDelete: Cascade)
+  saleItemOptions   SaleItemOption[]
+  optionRecipeItems OptionRecipeItem[]
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+
+  @@unique([name, modifierGroupId])
+  @@index([modifierGroupId])
+}
+
+model MenuItemModifierGroup {
+  menuItemId      String
+  modifierGroupId String
+  sortOrder       Int           @default(0)
+  menuItem        MenuItem      @relation(fields: [menuItemId], references: [id], onDelete: Cascade)
+  modifierGroup   ModifierGroup @relation(fields: [modifierGroupId], references: [id], onDelete: Cascade)
+
+  @@id([menuItemId, modifierGroupId])
+}
+
+// ─── Ingredients ─────────────────────────────────────────────────────────────
+
+model Ingredient {
+  id                String             @id @default(cuid())
+  name              String             @unique
+  category          String             @default("")
+  unit              String             @default("g")
+  currentStock      Decimal            @default(0) @db.Decimal(10, 2)
+  costPerUnit       Decimal            @default(0) @db.Decimal(10, 4)
+  lowStockThreshold Decimal            @default(0) @db.Decimal(10, 2)
+  isActive          Boolean            @default(true)
+  note              String             @default("")
+  recipeItems       RecipeItem[]
+  optionRecipeItems OptionRecipeItem[]
+  stockMovements    StockMovement[]
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+}
+
+// ─── Recipes ─────────────────────────────────────────────────────────────────
+
+model Recipe {
+  id                String       @id @default(cuid())
+  menuItemId        String
+  name              String       @default("")
+  drinkTypeOptionId String?
+  sizeOptionId      String?
+  isDefault         Boolean      @default(false)
+  isActive          Boolean      @default(true)
+  items             RecipeItem[]
+  menuItem          MenuItem     @relation(fields: [menuItemId], references: [id], onDelete: Cascade)
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  @@index([menuItemId])
+}
+
+model RecipeItem {
+  id           String     @id @default(cuid())
+  recipeId     String
+  ingredientId String
+  quantity     Decimal    @db.Decimal(10, 2)
+  unit         String
+  recipe       Recipe     @relation(fields: [recipeId], references: [id], onDelete: Cascade)
+  ingredient   Ingredient @relation(fields: [ingredientId], references: [id])
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  @@unique([recipeId, ingredientId])
+  @@index([recipeId])
+}
+
+// Extra ingredients added by modifier options (e.g. extra shot → 9g more beans)
+model OptionRecipeItem {
+  id               String         @id @default(cuid())
+  modifierOptionId String
+  ingredientId     String
+  quantity         Decimal        @db.Decimal(10, 2)
+  unit             String
+  modifierOption   ModifierOption @relation(fields: [modifierOptionId], references: [id], onDelete: Cascade)
+  ingredient       Ingredient     @relation(fields: [ingredientId], references: [id])
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  @@unique([modifierOptionId, ingredientId])
+  @@index([modifierOptionId])
+}
+
+// ─── Stock Movements ─────────────────────────────────────────────────────────
+
+model StockMovement {
+  id           String            @id @default(cuid())
+  ingredientId String
+  type         StockMovementType
+  // Signed quantity: positive = add, negative = deduct
+  quantity     Decimal           @db.Decimal(10, 2)
+  beforeStock  Decimal           @db.Decimal(10, 2)
+  afterStock   Decimal           @db.Decimal(10, 2)
+  unit         String
+  costPerUnit  Decimal           @db.Decimal(10, 4)
+  totalCost    Decimal           @db.Decimal(10, 4)
+  saleId       String?
+  saleItemId   String?
+  note         String            @default("")
+  ingredient   Ingredient        @relation(fields: [ingredientId], references: [id])
+  createdAt    DateTime          @default(now())
+
+  @@index([ingredientId])
+  @@index([type])
+  @@index([createdAt])
+  @@index([saleId])
+}
+
+// ─── Sales ───────────────────────────────────────────────────────────────────
+
+model Sale {
+  id            String        @id @default(cuid())
+  receiptNo     String        @unique
+  status        SaleStatus    @default(COMPLETED)
+  paymentMethod PaymentMethod
+  subtotal      Int
+  total         Int
+  received      Int?
+  change        Int?
+  note          String        @default("")
+  items         SaleItem[]
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  @@index([createdAt])
+  @@index([status])
+  @@index([paymentMethod])
+}
+
+model SaleItem {
+  id             String           @id @default(cuid())
+  saleId         String
+  menuItemId     String
+  name           String
+  quantity       Int
+  basePrice      Int
+  unitPrice      Int
+  total          Int
+  ingredientCost Decimal          @default(0) @db.Decimal(10, 2)
+  grossProfit    Decimal          @default(0) @db.Decimal(10, 2)
+  sale           Sale             @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  menuItem       MenuItem         @relation(fields: [menuItemId], references: [id])
+  options        SaleItemOption[]
+
+  @@index([saleId])
+}
+
+model SaleItemOption {
+  id               String         @id @default(cuid())
+  saleItemId       String
+  modifierGroupId  String
+  modifierOptionId String
+  groupName        String
+  optionName       String
+  priceDelta       Int
+  saleItem         SaleItem       @relation(fields: [saleItemId], references: [id], onDelete: Cascade)
+  modifierOption   ModifierOption @relation(fields: [modifierOptionId], references: [id])
+
+  @@index([saleItemId])
+}

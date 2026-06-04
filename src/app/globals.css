@@ -1,0 +1,33 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #f7f2ea;
+  --fg: #241f1a;
+  --brown: #4b3427;
+  --brown-light: #f0e5d7;
+  --border: #ded1be;
+  --muted: #74665a;
+  --green: #2f6f4e;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+button,
+a,
+input,
+textarea {
+  touch-action: manipulation;
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  body {
+    background: white;
+  }
+}
